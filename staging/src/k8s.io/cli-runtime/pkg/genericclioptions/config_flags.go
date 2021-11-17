@@ -105,6 +105,12 @@ type ConfigFlags struct {
 	// propagate the config to the places that need it, rather than
 	// loading the config multiple times
 	usePersistentConfig bool
+	// Allows increasing burst used for discovery, this is useful
+	// in clusters with many registered resources
+	discoveryBurst int
+	// Allows increasing qps used for discovery, this is useful
+	// in clusters with many registered resources
+	discoveryQPS float32
 }
 
 // ToRESTConfig implements RESTClientGetter.
@@ -221,10 +227,8 @@ func (f *ConfigFlags) ToDiscoveryClient() (discovery.CachedDiscoveryInterface, e
 		return nil, err
 	}
 
-	// The more groups you have, the more discovery requests you need to make.
-	// given 25 groups (our groups + a few custom resources) with one-ish version each, discovery needs to make 50 requests
-	// double it just so we don't end up here again for a while.  This config is only used for discovery.
-	config.Burst = 100
+	config.Burst = f.discoveryBurst
+	config.QPS = f.discoveryQPS
 
 	cacheDir := defaultCacheDir
 
@@ -317,6 +321,18 @@ func (f *ConfigFlags) AddFlags(flags *pflag.FlagSet) {
 func (f *ConfigFlags) WithDeprecatedPasswordFlag() *ConfigFlags {
 	f.Username = stringptr("")
 	f.Password = stringptr("")
+	return f
+}
+
+// WithDiscoveryBurst sets the RESTClient burst for discovery.
+func (f *ConfigFlags) WithDiscoveryBurst(discoveryBurst int) *ConfigFlags {
+	f.discoveryBurst = discoveryBurst
+	return f
+}
+
+// WithDiscoveryBurst sets the RESTClient burst for discovery.
+func (f *ConfigFlags) WithDiscoveryQPS(discoveryQPS float32) *ConfigFlags {
+	f.discoveryQPS = discoveryQPS
 	return f
 }
 
