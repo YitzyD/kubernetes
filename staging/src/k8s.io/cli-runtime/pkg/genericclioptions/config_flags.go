@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
+	utilpointer "k8s.io/utils/pointer"
 )
 
 const (
@@ -240,7 +241,7 @@ func (f *ConfigFlags) ToDiscoveryClient() (discovery.CachedDiscoveryInterface, e
 	httpCacheDir := filepath.Join(cacheDir, "http")
 	discoveryCacheDir := computeDiscoverCacheDir(filepath.Join(cacheDir, "discovery"), config.Host)
 
-	return diskcached.NewCachedDiscoveryClientForConfig(config, discoveryCacheDir, httpCacheDir, time.Duration(10*time.Minute))
+	return diskcached.NewCachedDiscoveryClientForConfig(config, discoveryCacheDir, httpCacheDir, time.Duration(6*time.Hour))
 }
 
 // ToRESTMapper returns a mapper.
@@ -319,8 +320,8 @@ func (f *ConfigFlags) AddFlags(flags *pflag.FlagSet) {
 
 // WithDeprecatedPasswordFlag enables the username and password config flags
 func (f *ConfigFlags) WithDeprecatedPasswordFlag() *ConfigFlags {
-	f.Username = stringptr("")
-	f.Password = stringptr("")
+	f.Username = utilpointer.StringPtr("")
+	f.Password = utilpointer.StringPtr("")
 	return f
 }
 
@@ -343,29 +344,25 @@ func NewConfigFlags(usePersistentConfig bool) *ConfigFlags {
 
 	return &ConfigFlags{
 		Insecure:   &insecure,
-		Timeout:    stringptr("0"),
-		KubeConfig: stringptr(""),
+		Timeout:    utilpointer.StringPtr("0"),
+		KubeConfig: utilpointer.StringPtr(""),
 
-		CacheDir:         stringptr(defaultCacheDir),
-		ClusterName:      stringptr(""),
-		AuthInfoName:     stringptr(""),
-		Context:          stringptr(""),
-		Namespace:        stringptr(""),
-		APIServer:        stringptr(""),
-		TLSServerName:    stringptr(""),
-		CertFile:         stringptr(""),
-		KeyFile:          stringptr(""),
-		CAFile:           stringptr(""),
-		BearerToken:      stringptr(""),
-		Impersonate:      stringptr(""),
+		CacheDir:         utilpointer.StringPtr(defaultCacheDir),
+		ClusterName:      utilpointer.StringPtr(""),
+		AuthInfoName:     utilpointer.StringPtr(""),
+		Context:          utilpointer.StringPtr(""),
+		Namespace:        utilpointer.StringPtr(""),
+		APIServer:        utilpointer.StringPtr(""),
+		TLSServerName:    utilpointer.StringPtr(""),
+		CertFile:         utilpointer.StringPtr(""),
+		KeyFile:          utilpointer.StringPtr(""),
+		CAFile:           utilpointer.StringPtr(""),
+		BearerToken:      utilpointer.StringPtr(""),
+		Impersonate:      utilpointer.StringPtr(""),
 		ImpersonateGroup: &impersonateGroup,
 
 		usePersistentConfig: usePersistentConfig,
 	}
-}
-
-func stringptr(val string) *string {
-	return &val
 }
 
 // overlyCautiousIllegalFileCharacters matches characters that *might* not be supported.  Windows is really restrictive, so this is really restrictive
