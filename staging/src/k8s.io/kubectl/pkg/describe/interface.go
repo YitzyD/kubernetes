@@ -18,6 +18,7 @@ package describe
 
 import (
 	"fmt"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 )
@@ -48,6 +49,8 @@ type ResourceDescriber interface {
 // describer to control what is printed.
 type DescriberSettings struct {
 	ShowEvents bool
+	UseKubelet bool
+	UseProm    bool
 }
 
 // ObjectDescriber is an interface for displaying arbitrary objects with extra

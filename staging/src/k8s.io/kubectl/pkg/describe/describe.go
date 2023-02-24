@@ -20,11 +20,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
+	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -3231,6 +3235,92 @@ type NodeDescriber struct {
 	clientset.Interface
 }
 
+// Perform a prometheus query returning the raw bytes response
+func promQuery(promQuery, promURL, promPort string) ([]byte, error) {
+	requestURL := fmt.Sprintf("%s:%s/api/v1/query", promURL, promPort)
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	query := req.URL.Query()
+	query.Add("query", promQuery)
+	req.URL.RawQuery = query.Encode()
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	resBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		return []byte{}, err
+	}
+	return resBody, nil
+}
+
+// Unmarshal a raw prometheus query response into a list of labels and label values
+// for each metric
+// The special label __value is set to the value of the metric
+func unmarshalPromResponseToMetrics(response []byte) ([]map[string]string, error) {
+	var responseUnmarshalled map[string]interface{}
+	// Unmarshal the json response into a map[string]interface{}
+	if err := json.Unmarshal(response, &responseUnmarshalled); err != nil {
+		return nil, err
+	}
+	// If the json response provided an error from prometheus, return that error message
+	if err, ok := responseUnmarshalled["error"]; ok {
+		errStr, _ := err.(string)
+		return nil, fmt.Errorf(errStr)
+	}
+	// Extract the data field from the query response
+	responseDataMap, ok := responseUnmarshalled["data"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("could not unmarshal prom response - data")
+	}
+	// Extract the result field from the query response data
+	responseResultMap, ok := responseDataMap["result"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("could not unmarshal prom response - result")
+	}
+	// Convert the metric labels into map[string]string for each metric
+	var metricsArr []map[string]string
+	for _, result := range responseResultMap {
+		resultMap, ok := result.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("could not unmarshal prom response - metric result")
+		}
+		// Extract the metric field from the metric response result. This contains the metric labels
+		metricMap, ok := resultMap["metric"].(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("could not unmarshal prom response - metric")
+		}
+		// Extract the value field from the metric response result. This contains the metric value
+		metricValue, ok := resultMap["value"].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("could not unmarshal prom response - value")
+		}
+		// Store the metric value into the special __value label
+		metricMap["__value"] = metricValue[1]
+		// Convert the metric labels from interface to string to produce a map[string]string per metric
+		metricMapStrStr := make(map[string]string)
+		for labelKey, labelValue := range metricMap {
+			labelValueStr, labelOk := labelValue.(string)
+			if !labelOk {
+				return nil, fmt.Errorf("could not extract labels from prom metric - %s", labelKey)
+			}
+			metricMapStrStr[labelKey] = labelValueStr
+		}
+		metricsArr = append(metricsArr, metricMapStrStr)
+	}
+	return metricsArr, nil
+}
+
+// Given a namespace and a name return namespace/name
+func namespacedName(namespace, name string) string {
+	return namespace + "/" + name
+}
+
 func (d *NodeDescriber) Describe(namespace, name string, describerSettings DescriberSettings) (string, error) {
 	mc := d.CoreV1().Nodes()
 	node, err := mc.Get(context.TODO(), name, metav1.GetOptions{})
@@ -3238,19 +3328,293 @@ func (d *NodeDescriber) Describe(namespace, name string, describerSettings Descr
 		return "", err
 	}
 
-	fieldSelector, err := fields.ParseSelector("spec.nodeName=" + name + ",status.phase!=" + string(corev1.PodSucceeded) + ",status.phase!=" + string(corev1.PodFailed))
-	if err != nil {
-		return "", err
-	}
 	// in a policy aware setting, users may have access to a node, but not all pods
 	// in that case, we note that the user does not have access to the pods
 	canViewPods := true
-	nodeNonTerminatedPodsList, err := d.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: fieldSelector.String()})
-	if err != nil {
-		if !errors.IsForbidden(err) {
+	nodeNonTerminatedPodsListFiltered := &corev1.PodList{}
+
+	// Extract prometheus server and prometheus server port from environ to be used
+	// in case UseProm is true
+	promUrl, promUrlExists := os.LookupEnv("KUBE_NODE_DESCRIBE_PROM_URL")
+	promPort, promPortExists := os.LookupEnv("KUBE_NODE_DESCRIBE_PROM_PORT")
+	if describerSettings.UseProm && promUrlExists && promPortExists {
+		// Use prometheus in order to list pods running on the node
+		// Metrics exported by kube-state-metrics are used to aggregate the pods
+		// and pod resources. https://github.com/kubernetes/kube-state-metrics
+		// Using data in the metrics, enough of the pod struct will be built
+		// in order for func describeNode to describe the node
+
+		// Collect metric kube_pod_info for the node
+		// The list of pods will be used to filter subsequent queries
+		kubePodInfoResponse, kubePodInfoErr := promQuery(fmt.Sprintf("kube_pod_info{node='%s'}", name), promUrl, promPort)
+		kubePodInfo, unMarshalErr := unmarshalPromResponseToMetrics(kubePodInfoResponse)
+		if kubePodInfoErr != nil || unMarshalErr != nil {
+			canViewPods = false
+		}
+		// Produce filters for the list of pods returned by kube_pod_info
+		// The filters are on pod name, pod namespace, and pod uid
+		// This is to constrain subsequent queries to pods only running on the node
+		// UID and namespace is used to safeguard against pods with the same name
+		// Using both is likely inordinately protective, but there is no harm in it
+		// Filters are in the form labelValue0|labelValue1|labelValue2
+		// to be used to regex match in the query
+		kubePodInfoPodNameList := make([]string, 0, len(kubePodInfo))
+		kubePodInfoPodNamespaceList := make([]string, 0, len(kubePodInfo))
+		kubePodInfoPodUIDList := make([]string, 0, len(kubePodInfo))
+		for _, metric := range kubePodInfo {
+			kubePodInfoPodNameList = append(kubePodInfoPodNameList, metric["pod"])
+			kubePodInfoPodNamespaceList = append(kubePodInfoPodNamespaceList, metric["namespace"])
+			kubePodInfoPodUIDList = append(kubePodInfoPodUIDList, metric["uid"])
+		}
+		podNamePromFilter := strings.Join(kubePodInfoPodNameList[:], "|")
+		podNamespacePromFilter := strings.Join(kubePodInfoPodNamespaceList[:], "|")
+		podUIDPromFilter := strings.Join(kubePodInfoPodUIDList[:], "|")
+
+		// Collect metric kube_pod_status_phase for the node
+		// filtering out pods with phase Failed or Succeeded
+		kubePodStatusResponse, kubePodStatusErr := promQuery(fmt.Sprintf("kube_pod_status_phase{phase != 'Failed', phase != 'Succeeded', pod=~'%s', namespace=~'%s', uid=~'%s'}  == 1", podNamePromFilter, podNamespacePromFilter, podUIDPromFilter), promUrl, promPort)
+		kubePodStatus, unMarshalErr := unmarshalPromResponseToMetrics(kubePodStatusResponse)
+		if kubePodStatusErr != nil || unMarshalErr != nil {
+			canViewPods = false
+		}
+		// Collect metric kube_pod_container_resource_requests for the node
+		kubePodResourceRequestsResponse, kubePodResourceRequestsErr := promQuery(fmt.Sprintf("sum by(pod, namespace, resource) (kube_pod_container_resource_requests{node='%s'})", name), promUrl, promPort)
+		kubePodRequests, unMarshalErr := unmarshalPromResponseToMetrics(kubePodResourceRequestsResponse)
+		if kubePodResourceRequestsErr != nil || unMarshalErr != nil {
+			canViewPods = false
+		}
+		// Collect metric kube_pod_container_resource_limits for the node
+		kubePodResourceLimitsResponse, kubePodResourceLimitsErr := promQuery(fmt.Sprintf("sum by(pod, namespace, resource) (kube_pod_container_resource_limits{node='%s'})", name), promUrl, promPort)
+		kubePodLimits, unMarshalErr := unmarshalPromResponseToMetrics(kubePodResourceLimitsResponse)
+		if kubePodResourceLimitsErr != nil || unMarshalErr != nil {
+			canViewPods = false
+		}
+		// Collect metric kube_pod_created for the node
+		kubePodCreatedResponse, kubePodCreatedErr := promQuery(fmt.Sprintf("kube_pod_created{pod=~'%s', namespace=~'%s', uid=~'%s'}", podNamePromFilter, podNamespacePromFilter, podUIDPromFilter), promUrl, promPort)
+		kubePodCreated, unMarshalErr := unmarshalPromResponseToMetrics(kubePodCreatedResponse)
+		if kubePodCreatedErr != nil || unMarshalErr != nil {
+			canViewPods = false
+		}
+
+		// podsData is a map containing the data to be used to generate pod structs
+		// extracted from the collected metrics
+		// podsData is keyed on the pod namespace/name, with an added suffix to denote the type of data stored
+		// ex. podsData[namespace/name.resources.requests] contains the pod resource requests
+		// A special key of podsData[namespacedNames] stores all the namespaced names of pods from collected metrics
+		// in its keys to aid in easy listing of pods
+		podsData := make(map[string](map[string](string)))
+		podsDataKeyNamespacedNames := "namespaceNames"
+		podsDataKeySuffixMetadata := ".metadata"
+		podsDataKeySuffixStatus := ".status"
+		podsDataKeySuffixResourcesRequest := ".resources.requests"
+		podsDataKeySuffixResourcesLimits := ".resources.limits"
+
+		// Initialize podsData namespaced names map
+		podsData[podsDataKeyNamespacedNames] = make(map[string]string)
+
+		// Aggregate the pod metadata - name and namespace
+		// - podsData[name/namespace.metadata]
+		for _, metric := range kubePodInfo {
+			podName, nameOk := metric["pod"]
+			podNamespace, namespaceOk := metric["namespace"]
+			if !nameOk || !namespaceOk {
+				continue
+			}
+			podMetadata, ok := podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixMetadata]
+			if !ok {
+				podMetadata = make(map[string](string))
+				podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixMetadata] = podMetadata
+			}
+			podMetadata["name"] = podName
+			podMetadata["namespace"] = podNamespace
+			podsData[podsDataKeyNamespacedNames][namespacedName(podNamespace, podName)] = ""
+		}
+		// Aggregate the pod metadata - creationTimestamp
+		// - podsData[name/namespace.metadata]
+		for _, metric := range kubePodCreated {
+			podName, nameOk := metric["pod"]
+			podNamespace, namespaceOk := metric["namespace"]
+			podCreated, createdOk := metric["__value"]
+			if !nameOk || !namespaceOk || !createdOk {
+				continue
+			}
+			podMetadata, ok := podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixMetadata]
+			if !ok {
+				podMetadata = make(map[string](string))
+				podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixMetadata] = podMetadata
+			}
+			podMetadata["creationTimestamp"] = podCreated
+			podsData[podsDataKeyNamespacedNames][namespacedName(podNamespace, podName)] = ""
+		}
+		// Aggregate the pod resource requests
+		// - podsData[name/namespace.resource.requests]
+		for _, metric := range kubePodRequests {
+			podName, nameOk := metric["pod"]
+			podNamespace, namespaceOk := metric["namespace"]
+			podRequestResourceType, typeOk := metric["resource"]
+			podRequestResourceValue, valueOk := metric["__value"]
+			if !nameOk || !namespaceOk || !typeOk || !valueOk {
+				continue
+			}
+			podRequestsData, ok := podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixResourcesRequest]
+			if !ok {
+				podRequestsData = make(map[string](string))
+				podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixResourcesRequest] = podRequestsData
+			}
+			podRequestsData[podRequestResourceType] = podRequestResourceValue
+			podsData[podsDataKeyNamespacedNames][namespacedName(podNamespace, podName)] = ""
+		}
+		// Aggregate the pod resource limits
+		// - podsData[name/namespace.resource.limits]
+		for _, metric := range kubePodLimits {
+			podName, nameOk := metric["pod"]
+			podNamespace, namespaceOk := metric["namespace"]
+			podLimitsResourceType, typeOk := metric["resource"]
+			podLimitsResourceValue, valueOk := metric["__value"]
+			if !nameOk || !namespaceOk || !typeOk || !valueOk {
+				continue
+			}
+			podLimitsData, ok := podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixResourcesLimits]
+			if !ok {
+				podLimitsData = make(map[string](string))
+				podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixResourcesLimits] = podLimitsData
+			}
+			podLimitsData[podLimitsResourceType] = podLimitsResourceValue
+			podsData[podsDataKeyNamespacedNames][namespacedName(podNamespace, podName)] = ""
+		}
+		// Aggregate the pod status
+		// - podsData[name/namespace.status]
+		for _, metric := range kubePodStatus {
+			podName, nameOk := metric["pod"]
+			podNamespace, namespaceOk := metric["namespace"]
+			podPhase, phaseOk := metric["phase"]
+			if !nameOk || !namespaceOk || !phaseOk {
+				continue
+			}
+			podStatusData, ok := podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixStatus]
+			if !ok {
+				podStatusData = make(map[string](string))
+				podsData[namespacedName(podNamespace, podName)+podsDataKeySuffixStatus] = podStatusData
+			}
+			podStatusData["phase"] = podPhase
+			podsData[podsDataKeyNamespacedNames][namespacedName(podNamespace, podName)] = ""
+		}
+
+		// Build enough of a pod struct to describe the node for all pods collected from metrics
+		for podNamespacedName, _ := range podsData[podsDataKeyNamespacedNames] {
+			podDataMeta := podsData[podNamespacedName+podsDataKeySuffixMetadata]
+			podDataStatus := podsData[podNamespacedName+podsDataKeySuffixStatus]
+			podDataResourceRequests := podsData[podNamespacedName+podsDataKeySuffixResourcesRequest]
+			podDataResourceLimits := podsData[podNamespacedName+podsDataKeySuffixResourcesLimits]
+
+			pod := corev1.Pod{}
+			// Build pod metadata - name, namespace, creationTimestamp
+			pod.SetName(podDataMeta["name"])
+			pod.SetNamespace(podDataMeta["namespace"])
+			createdInt, _ := strconv.ParseInt(podDataMeta["creationTimestamp"], 10, 64)
+			pod.SetCreationTimestamp(metav1.NewTime(time.Unix(createdInt, 0)))
+
+			// Build pod status - phase
+			pod.Status.Phase = corev1.PodPhase(podDataStatus["phase"])
+
+			// Build pod container - resources
+			container := corev1.Container{}
+			container.Resources.Requests = make(map[corev1.ResourceName]resource.Quantity)
+			container.Resources.Limits = make(map[corev1.ResourceName]resource.Quantity)
+
+			// // Manually build cpu and memory resources in order to set the resource.Format accordingly
+			cpuRequestFloat, _ := strconv.ParseFloat(podDataResourceRequests["cpu"], 64)
+			memoryRequestInt, _ := strconv.ParseInt(podDataResourceRequests["memory"], 10, 64)
+			cpuLimitsFloat, _ := strconv.ParseFloat(podDataResourceLimits["cpu"], 64)
+			memoryLimitsInt, _ := strconv.ParseInt(podDataResourceLimits["memory"], 10, 64)
+			container.Resources.Requests[corev1.ResourceCPU] = *resource.NewMilliQuantity(int64(cpuRequestFloat*1000), resource.DecimalSI)
+			container.Resources.Requests[corev1.ResourceMemory] = *resource.NewQuantity(memoryRequestInt, resource.BinarySI)
+			container.Resources.Limits[corev1.ResourceCPU] = *resource.NewMilliQuantity(int64(cpuLimitsFloat*1000), resource.DecimalSI)
+			container.Resources.Limits[corev1.ResourceMemory] = *resource.NewQuantity(memoryLimitsInt, resource.BinarySI)
+			// Catch all, providing all additional resources generically - requests
+			for resourceName, value := range podDataResourceRequests {
+				if resourceName == string(corev1.ResourceCPU) || resourceName == string(corev1.ResourceMemory) {
+					continue
+				}
+				for nodeResourceName, _ := range node.Status.Allocatable {
+					rgx := regexp.MustCompile("[^a-zA-Z0-9_]")
+
+					nodeResourceNameClean := rgx.ReplaceAllString(string(nodeResourceName), "_")
+					if nodeResourceNameClean == resourceName {
+						resourceValue, _ := resource.ParseQuantity(value)
+						container.Resources.Requests[corev1.ResourceName(nodeResourceName)] = resourceValue
+					}
+				}
+			}
+			// Catch all, providing all additional resources generically - limits
+			for resourceName, value := range podDataResourceLimits {
+				if resourceName == string(corev1.ResourceCPU) || resourceName == string(corev1.ResourceMemory) {
+					continue
+				}
+				for nodeResourceName, _ := range node.Status.Allocatable {
+					rgx := regexp.MustCompile("[^a-zA-Z0-9_]")
+
+					nodeResourceNameClean := rgx.ReplaceAllString(string(nodeResourceName), "_")
+					if nodeResourceNameClean == resourceName {
+						resourceValue, _ := resource.ParseQuantity(value)
+						container.Resources.Limits[corev1.ResourceName(nodeResourceName)] = resourceValue
+					}
+				}
+			}
+			pod.Spec.Containers = append(pod.Spec.Containers, container)
+			nodeNonTerminatedPodsListFiltered.Items = append(nodeNonTerminatedPodsListFiltered.Items, pod)
+		}
+		// Sort pods by namespace then name
+		sort.Slice(nodeNonTerminatedPodsListFiltered.Items, func(i, j int) bool {
+			if nodeNonTerminatedPodsListFiltered.Items[i].Namespace == nodeNonTerminatedPodsListFiltered.Items[j].Namespace {
+				return strings.Compare(nodeNonTerminatedPodsListFiltered.Items[i].Name, nodeNonTerminatedPodsListFiltered.Items[j].Name) == -1
+			}
+			return strings.Compare(nodeNonTerminatedPodsListFiltered.Items[i].Namespace, nodeNonTerminatedPodsListFiltered.Items[j].Namespace) == -1
+		})
+	} else if describerSettings.UseKubelet {
+		// Use kubelet api in order to list pods running on the node
+		// The request is proxied via the apiserver, and therefore the client
+		// must have permission to GET nodes/proxy for the node in order to
+		// use this method
+
+		nodeNonTerminatedPodsList := &corev1.PodList{}
+		// Request /pods from the kubelet api for the node proxied via the apiserver
+		nodePodListRequest := d.CoreV1().RESTClient().Get().Resource("nodes").Name(name).SubResource("proxy").Suffix("pods")
+		nodePodListResponse, err := nodePodListRequest.DoRaw(context.TODO())
+		if err != nil {
+			canViewPods = false
+		}
+		// Unmarshal the response into a PodList
+		err = json.Unmarshal(nodePodListResponse, nodeNonTerminatedPodsList)
+		if err != nil {
+			canViewPods = false
+		}
+		// Filter out all pods that are in phase Failed or Succeeded
+		nodeNonTerminatedPodsListFiltered.ListMeta = nodeNonTerminatedPodsList.ListMeta
+		for _, pod := range nodeNonTerminatedPodsList.Items {
+			if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+				nodeNonTerminatedPodsListFiltered.Items = append(nodeNonTerminatedPodsListFiltered.Items, pod)
+			}
+		}
+		// Sort pods by namespace then name
+		sort.Slice(nodeNonTerminatedPodsListFiltered.Items, func(i, j int) bool {
+			if nodeNonTerminatedPodsListFiltered.Items[i].Namespace == nodeNonTerminatedPodsListFiltered.Items[j].Namespace {
+				return strings.Compare(nodeNonTerminatedPodsListFiltered.Items[i].Name, nodeNonTerminatedPodsListFiltered.Items[j].Name) == -1
+			}
+			return strings.Compare(nodeNonTerminatedPodsListFiltered.Items[i].Namespace, nodeNonTerminatedPodsListFiltered.Items[j].Namespace) == -1
+		})
+	} else {
+		fieldSelector, err := fields.ParseSelector("spec.nodeName=" + name + ",status.phase!=" + string(corev1.PodSucceeded) + ",status.phase!=" + string(corev1.PodFailed))
+		if err != nil {
 			return "", err
 		}
-		canViewPods = false
+		nodeNonTerminatedPodsListFiltered, err = d.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: fieldSelector.String()})
+		if err != nil {
+			if !errors.IsForbidden(err) {
+				return "", err
+			}
+			canViewPods = false
+		}
 	}
 
 	var events *corev1.EventList
@@ -3264,7 +3628,7 @@ func (d *NodeDescriber) Describe(namespace, name string, describerSettings Descr
 		}
 	}
 
-	return describeNode(node, nodeNonTerminatedPodsList, events, canViewPods, &LeaseDescriber{d})
+	return describeNode(node, nodeNonTerminatedPodsListFiltered, events, canViewPods, &LeaseDescriber{d})
 }
 
 type LeaseDescriber struct {
@@ -4648,7 +5012,7 @@ func (d *Describers) DescribeObject(exact interface{}, extra ...interface{}) (st
 // Add adds one or more describer functions to the Describer. The passed function must
 // match the signature:
 //
-//     func(...) (string, error)
+//	func(...) (string, error)
 //
 // Any number of arguments may be provided.
 func (d *Describers) Add(fns ...interface{}) error {

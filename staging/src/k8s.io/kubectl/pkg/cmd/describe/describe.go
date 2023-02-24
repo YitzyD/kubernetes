@@ -18,6 +18,7 @@ package describe
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -92,6 +93,8 @@ func NewCmdDescribe(parent string, f cmdutil.Factory, streams genericclioptions.
 		FilenameOptions: &resource.FilenameOptions{},
 		DescriberSettings: &describe.DescriberSettings{
 			ShowEvents: true,
+			UseKubelet: false,
+			UseProm:    false,
 		},
 
 		CmdParent: parent,
@@ -115,6 +118,8 @@ func NewCmdDescribe(parent string, f cmdutil.Factory, streams genericclioptions.
 	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
 	cmd.Flags().BoolVarP(&o.AllNamespaces, "all-namespaces", "A", o.AllNamespaces, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
 	cmd.Flags().BoolVar(&o.DescriberSettings.ShowEvents, "show-events", o.DescriberSettings.ShowEvents, "If true, display events related to the described object.")
+	cmd.Flags().BoolVar(&o.DescriberSettings.UseKubelet, "use-kubelet", o.DescriberSettings.UseKubelet, "If true, uses kubelet to get currently running pods when describing nodes. Requires nodes/proxy RBAC. Also set by environment variable KUBE_NODE_DESCRIBE_LISTER=kubelet.")
+	cmd.Flags().BoolVar(&o.DescriberSettings.UseProm, "use-prom", o.DescriberSettings.UseProm, "If true, uses prometheus to get currently running pods when describing nodes. Requires environment variables KUBE_NODE_DESCRIBE_PROM_URL and KUBE_NODE_DESCRIBE_PROM_PORT to be set accordingly. Also set by environment variable KUBE_NODE_DESCRIBE_LISTER=prom.")
 	return cmd
 }
 
@@ -140,6 +145,13 @@ func (o *DescribeOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args [
 	}
 
 	o.NewBuilder = f.NewBuilder
+
+	switch os.Getenv("KUBE_NODE_DESCRIBE_LISTER") {
+	case "kubelet":
+		o.DescriberSettings.UseKubelet = true
+	case "prom":
+		o.DescriberSettings.UseProm = true
+	}
 
 	return nil
 }
