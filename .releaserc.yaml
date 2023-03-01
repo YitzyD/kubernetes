@@ -3,7 +3,7 @@ branches:
 preset: "angular"
 plugins:
 - "@semantic-release/commit-analyzer"
-repositoryUrl: "git@github.com:YitzyD/kubernetes.git"
+repositoryUrl: "https://github.com/YitzyD/kubernetes.git"
 analyzeCommits:
 - path: "@semantic-release/commit-analyzer"
   releaseRules:
