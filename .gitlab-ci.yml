@@ -9,6 +9,12 @@ build:operator:
   only:
     refs:
     - yd/v1.20.15/describe-node-listers
+  variables:
+    KUBE_GIT_MAJOR: "1"
+    KUBE_GIT_MINOR: "20"
+    KUBE_GIT_VERSION: "v1.20.15-enhanced-describe"
+    KUBE_GIT_COMMIT: ${CI_COMMIT_SHA}
+
   artifacts:
     paths:
       - _output/bin/kubectl
