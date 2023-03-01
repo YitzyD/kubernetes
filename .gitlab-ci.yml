@@ -10,7 +10,7 @@ build:operator:
     refs:
     - yd/v1.20.5/describe-node-listers
   before_script:
-    - apk add make bash
+    - apk add make bash rsync
   script:
     - make kubectl
 
