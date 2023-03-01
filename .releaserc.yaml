@@ -1,7 +1,7 @@
 branches:
-- yd/v1.20.5/describe-node-listers
+- yd/v1.20.15/describe-node-listers
 preset: "angular"
-tagFormat: v1.20.5-enhanced-describe-v${version}
+tagFormat: v1.20.15-enhanced-describe-v${version}
 plugins:
 - "@semantic-release/commit-analyzer"
 repositoryUrl: "https://github.com/YitzyD/kubernetes.git"
