@@ -9,6 +9,9 @@ build:operator:
   only:
     refs:
     - yd/v1.20.5/describe-node-listers
+  artifacts:
+    paths:
+      - _output/bin/kubectl
   before_script:
     - apk add make bash rsync
   script:
