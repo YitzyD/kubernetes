@@ -20,7 +20,7 @@ build:operator:
 build:release:
   stage: release
   image:
-    name: 18.14.2-alpine3.16
+    name: node:18.14.2-alpine3.16
   only:
     refs:
     - yd/v1.20.5/describe-node-listers
