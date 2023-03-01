@@ -20,9 +20,11 @@ build:operator:
 build:release:
   stage: release
   image:
-    name: node:18.14.2-alpine3.16
+    name: alpine:3.16.1
   only:
     refs:
     - yd/v1.20.5/describe-node-listers
+  before_script:
+    - apk add git nodejs npm openssh
   script:
   - npx semantic-release
