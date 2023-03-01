@@ -25,6 +25,7 @@ build:release:
     refs:
     - yd/v1.20.5/describe-node-listers
   before_script:
-    - apk add git nodejs npm openssh
+  - apk add git nodejs npm openssh
+  - npm install
   script:
   - npx semantic-release
