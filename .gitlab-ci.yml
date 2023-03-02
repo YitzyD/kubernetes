@@ -14,12 +14,11 @@ build:operator:
     KUBE_GIT_MINOR: "20"
     KUBE_GIT_VERSION: "v1.20.15-enhanced-describe"
     KUBE_GIT_COMMIT: ${CI_COMMIT_SHA}
-
   artifacts:
     paths:
       - _output/bin/kubectl
   before_script:
-    - apk add make bash rsync
+    - apk add make bash rsync git
   script:
     - make kubectl
 
